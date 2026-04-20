@@ -1,0 +1,5 @@
+https://wokwi.com/projects/460703890431105025
+
+
+This is a failed simulation where we tried to simulate our block diagram we initially had . However we were not able to simulate it due to wokwi not having the necessary components, i.e. the pca9685 would have to be taken from a seperate custom made simulation , so were other parts. 
+therefore the simulation part failed and we directly resorted to building the physical circuit.
