@@ -1,0 +1,158 @@
+# oled_sim.py
+# In the real robot:  ESP32 SPI → SSD1309 2.42" OLED (128×64)
+# In Wokwi sim:       ESP32 I2C → SSD1306 0.96" OLED (128×64)
+
+
+from machine import I2C, Pin
+import ssd1306
+import math
+import time
+
+
+class FaceController:
+    """
+    Draws animated robot faces using the built-in ssd1306 module.
+    Drop-in replacement for oled_face.FaceController.
+    Same set_state() and update() interface.
+    """
+
+    BLINK_EVERY_MS = 3500
+    BLINK_HOLD_MS  = 130
+
+    _EYES = {
+        'normal': [(36, 30, 14, 14), (92, 30, 14, 14)],
+        'wide':   [(36, 28, 17, 17), (92, 28, 17, 17)],
+        'happy':  [(36, 32, 14,  9), (92, 32, 14,  9)],
+        'sleepy': [(36, 34, 14,  5), (92, 34, 14,  5)],
+        'blink':  [(36, 34, 14,  2), (92, 34, 14,  2)],
+        'squint': [(36, 34, 14,  6), (92, 34, 14,  6)],
+    }
+
+    def __init__(self, sda_pin: int, scl_pin: int,
+                 addr: int = 0x3C, width: int = 128, height: int = 64):
+        i2c = I2C(0, sda=Pin(sda_pin), scl=Pin(scl_pin), freq=400_000)
+
+        # Scan and report — helps catch wiring issues
+        found = i2c.scan()
+        print(f'[OLED] I2C scan: {[hex(a) for a in found]}')
+
+        self.d = ssd1306.SSD1306_I2C(width, height, i2c, addr=addr)
+        self.w = width
+        self.h = height
+
+        self._state       = 'idle'
+        self._blinking    = False
+        self._last_blink  = time.ticks_ms()
+        self._blink_start = 0
+        self._pupil_x     = 0
+        self._pupil_y     = 0
+        self._wander_step = 0
+        self._wander_time = time.ticks_ms()
+
+        self.d.fill(0)
+        self.d.show()
+
+    # ── Public interface (identical to oled_face.FaceController) ─────────────
+
+    def set_state(self, state: str):
+        if state != self._state:
+            self._state = state
+            self._draw()
+
+    def update(self):
+        """Call every main loop — handles blinking and pupil wander."""
+        now = time.ticks_ms()
+
+        if self._blinking:
+            if time.ticks_diff(now, self._blink_start) >= self.BLINK_HOLD_MS:
+                self._blinking = False
+                self._draw()
+        else:
+            if (self._state != 'sleep' and
+                    time.ticks_diff(now, self._last_blink) >= self.BLINK_EVERY_MS):
+                self._blinking  = True
+                self._blink_start = now
+                self._last_blink  = now
+                self._draw_blink()
+
+        if self._state == 'idle':
+            positions = [(0,0),(3,0),(3,2),(0,2),(-3,2),(-3,0),(-3,-2),(0,-2)]
+            if time.ticks_diff(now, self._wander_time) >= 1800:
+                self._wander_step = (self._wander_step + 1) % len(positions)
+                self._pupil_x, self._pupil_y = positions[self._wander_step]
+                self._wander_time = now
+                if not self._blinking:
+                    self._draw()
+
+    # ── Internal drawing ──────────────────────────────────────────────────────
+
+    def _ellipse_fill(self, cx, cy, rx, ry, c):
+        """Filled ellipse using horizontal scanlines (ssd1306 has no ellipse)."""
+        for dy in range(-ry, ry + 1):
+            if ry == 0:
+                break
+            dx = int(rx * math.sqrt(max(0, 1 - (dy / ry) ** 2)))
+            x0 = max(0, cx - dx)
+            x1 = min(self.w - 1, cx + dx)
+            if x0 <= x1:
+                self.d.hline(x0, cy + dy, x1 - x0 + 1, c)
+
+    def _draw_eyes(self, eye_key, px=0, py=0):
+        for (cx, cy, rx, ry) in self._EYES[eye_key]:
+            self._ellipse_fill(cx, cy, rx, ry, 1)
+            self._ellipse_fill(cx, cy, rx - 2, ry - 2, 0)
+            self._ellipse_fill(cx + px, cy + py, 5, 5, 1)
+            self.d.pixel(cx + px - 2, cy + py - 2, 0)
+
+    def _draw_smile(self):
+        for i in range(-18, 19):
+            x = 64 + i
+            y = 54 + (i * i) // 32
+            if 0 <= x < self.w and 0 <= y < self.h:
+                self.d.pixel(x, y, 1)
+                self.d.pixel(x, y + 1, 1)
+
+    def _draw_zzz(self):
+        self.d.text('zZz', 96, 10, 1)
+
+    def _draw_sparkles(self):
+        for (x, y) in [(6, 6), (118, 6), (5, 54), (120, 52)]:
+            self.d.fill_rect(x, y, 2, 2, 1)
+
+    def _draw_brow_angry(self):
+        self.d.line(18, 10, 40, 16, 1)
+        self.d.line(18, 11, 40, 17, 1)
+        self.d.line(80, 16, 110, 10, 1)
+        self.d.line(80, 17, 110, 11, 1)
+
+    def _draw(self):
+        if self._blinking:
+            return
+        self.d.fill(0)
+        ox, oy = self._pupil_x, self._pupil_y
+
+        if self._state == 'idle':
+            self._draw_eyes('normal', ox, oy)
+        elif self._state == 'walk':
+            self._draw_eyes('normal', 0, 2)
+        elif self._state == 'excited':
+            self._draw_eyes('wide', ox, oy)
+            self._draw_sparkles()
+            self._draw_smile()
+        elif self._state == 'happy':
+            self._draw_eyes('happy', ox, oy)
+            self._draw_smile()
+        elif self._state == 'angry':
+            self._draw_eyes('squint', 0, 1)
+            self._draw_brow_angry()
+        elif self._state == 'sleep':
+            self._draw_eyes('sleepy', 0, 3)
+            self._draw_zzz()
+
+        self.d.show()
+
+    def _draw_blink(self):
+        self.d.fill(0)
+        self._draw_eyes('blink')
+        self.d.show()
+
