@@ -1,0 +1,51 @@
+from machine import I2C, Pin
+import time
+
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400_000)
+PCA_ADDR  = 0x40
+MODE1     = 0x00
+PRESCALE  = 0xFE
+LED0_ON_L = 0x06
+
+def write_reg(reg, val):
+    i2c.writeto_mem(PCA_ADDR, reg, bytes([val]))
+
+def read_reg(reg):
+    return i2c.readfrom_mem(PCA_ADDR, reg, 1)[0]
+
+def pca_init():
+    write_reg(MODE1, 0x00)
+    time.sleep_ms(10)
+    prescale = round(25_000_000 / (4096 * 50)) - 1
+    old = read_reg(MODE1)
+    write_reg(MODE1, (old & 0x7F) | 0x10)
+    write_reg(PRESCALE, prescale)
+    write_reg(MODE1, old)
+    time.sleep_ms(5)
+    write_reg(MODE1, old | 0xA1)
+
+def angle_to_tick(angle):
+    pulse_us = 500 + (2400 - 500) * angle / 180.0
+    return int(pulse_us * 4096 / 20000)
+
+def set_servo(channel, angle):
+    tick = angle_to_tick(angle)
+    base = LED0_ON_L + 4 * channel
+    i2c.writeto_mem(PCA_ADDR, base,
+                    bytes([0, 0, tick & 0xFF, tick >> 8]))
+
+pca_init()
+
+# ── Set individual servos here ─────────────────────────────────────────────────
+# Comment out any line to skip that servo
+
+set_servo(0, 0)   # Ch0 — Front-Right TOP
+#set_servo(1, 0)  # Ch1 — Front-Left  TOP
+#set_servo(2, 0)  # Ch2 — Back-Left   TOP
+#set_servo(3, 0)  # Ch3 — Back-Right  TOP
+#set_servo(4, 0)  # Ch4 — Front-Right BOTTOM
+#set_servo(5, 0)  # Ch5 — Front-Left  BOTTOM
+#set_servo(6, 0)  # Ch6 — Back-Left   BOTTOM
+#set_servo(7, 0)  # Ch7 — Back-Right  BOTTOM
+
+print("Done")
