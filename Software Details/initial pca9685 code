@@ -1,0 +1,243 @@
+from machine import I2C, Pin
+import time
+import math
+
+# ── I2C & PCA9685 setup ────────────────────────────────────────────────────────
+I2C_SCL_PIN = 22
+I2C_SDA_PIN = 21
+PCA9685_ADDR = 0x40
+PCA9685_FREQ = 50  # 50 Hz for servos
+
+i2c = I2C(0, scl=Pin(I2C_SCL_PIN), sda=Pin(I2C_SDA_PIN), freq=400_000)
+
+# ── PCA9685 register addresses ─────────────────────────────────────────────────
+MODE1     = 0x00
+MODE2     = 0x01
+PRESCALE  = 0xFE
+LED0_ON_L = 0x06
+
+# ── Number of servos ───────────────────────────────────────────────────────────
+NUM_SERVOS = 8
+CHANNELS   = list(range(NUM_SERVOS))   # [0, 1, 2, 3, 4, 5, 6, 7]
+
+# ── Low-level helpers ──────────────────────────────────────────────────────────
+def write_reg(reg, val):
+    i2c.writeto_mem(PCA9685_ADDR, reg, bytes([val]))
+
+def read_reg(reg):
+    return i2c.readfrom_mem(PCA9685_ADDR, reg, 1)[0]
+
+# ── Initialise PCA9685 ─────────────────────────────────────────────────────────
+def pca9685_init():
+    write_reg(MODE1, 0x00)
+    time.sleep_ms(10)
+
+    prescale_val = round(25_000_000 / (4096 * PCA9685_FREQ)) - 1
+
+    old_mode = read_reg(MODE1)
+    write_reg(MODE1, (old_mode & 0x7F) | 0x10)  # sleep to change prescale
+    write_reg(PRESCALE, prescale_val)
+    write_reg(MODE1, old_mode)
+    time.sleep_ms(5)
+    write_reg(MODE1, old_mode | 0xA1)            # auto-increment + restart
+
+# ── Burst-write all 8 channels in ONE I2C transaction ─────────────────────────
+def set_all_servos_raw(ticks):
+    """
+    Write off-ticks for all 8 channels in a single I2C burst.
+    ticks : list/tuple of 8 integer tick values (one per channel, in order).
+
+    PCA9685 auto-increment latches every channel on the same PWM frame
+    → all 8 servos move at exactly the same time.
+    """
+    buf = bytearray(4 * NUM_SERVOS)
+    for i, off in enumerate(ticks):
+        idx         = i * 4
+        buf[idx]     = 0          # ON_L  (pulse always starts at tick 0)
+        buf[idx + 1] = 0          # ON_H
+        buf[idx + 2] = off & 0xFF # OFF_L
+        buf[idx + 3] = off >> 8   # OFF_H
+    i2c.writeto_mem(PCA9685_ADDR, LED0_ON_L, buf)
+
+# ── MG90S pulse calibration ────────────────────────────────────────────────────
+SERVO_MIN_US = 500    # µs  →  0°
+SERVO_MAX_US = 2400   # µs  → 180°
+PERIOD_US    = 20_000 # µs at 50 Hz  (1 tick ≈ 4.88 µs)
+
+def angle_to_tick(angle):
+    angle    = max(0.0, min(180.0, angle))
+    pulse_us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * angle / 180.0
+    return int(pulse_us * 4096 / PERIOD_US)
+
+def servos_move(angles):
+    """
+    Move all 8 servos simultaneously.
+    angles : iterable of 8 values in degrees (0 – 180).
+    """
+    set_all_servos_raw([angle_to_tick(a) for a in angles])
+
+# ── Utility: centre all servos ─────────────────────────────────────────────────
+def centre_all():
+    servos_move([90] * NUM_SERVOS)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Motion patterns
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pattern_sweep_together(reps=2, step=2, delay_ms=12):
+    """All 8 servos sweep 0 → 180 → 0 in perfect unison."""
+    print("Pattern: sweep together")
+    for _ in range(reps):
+        for a in range(0, 181, step):
+            servos_move([a] * NUM_SERVOS)
+            time.sleep_ms(delay_ms)
+        for a in range(180, -1, -step):
+            servos_move([a] * NUM_SERVOS)
+            time.sleep_ms(delay_ms)
+
+
+def pattern_sweep_opposite(reps=2, step=2, delay_ms=12):
+    """
+    Even channels (0,2,4,6) sweep forward;
+    odd  channels (1,3,5,7) sweep in reverse simultaneously.
+    """
+    print("Pattern: even vs odd opposite")
+    for _ in range(reps):
+        for a in range(0, 181, step):
+            angles = [a if ch % 2 == 0 else 180 - a for ch in CHANNELS]
+            servos_move(angles)
+            time.sleep_ms(delay_ms)
+        for a in range(180, -1, -step):
+            angles = [a if ch % 2 == 0 else 180 - a for ch in CHANNELS]
+            servos_move(angles)
+            time.sleep_ms(delay_ms)
+
+
+def pattern_wave(reps=3, step=1, delay_ms=10):
+    """
+    Each servo is phase-shifted by 360/8 = 45° so they roll like an ocean wave.
+    Uses a sine function mapped to 0-180° range.
+    """
+    print("Pattern: sine wave")
+    phase_offset = 2 * math.pi / NUM_SERVOS   # 45° between adjacent servos
+    total_steps  = int(360 / step)
+
+    for _ in range(reps):
+        for t in range(total_steps):
+            theta  = 2 * math.pi * t / total_steps
+            angles = [
+                90 + 90 * math.sin(theta - ch * phase_offset)
+                for ch in CHANNELS
+            ]
+            servos_move(angles)
+            time.sleep_ms(delay_ms)
+
+
+def pattern_cascade(reps=2, step=2, delay_ms=8):
+    """
+    Servos sweep sequentially offset by (180 / NUM_SERVOS) degrees,
+    producing a rolling domino / centipede-leg effect.
+    """
+    print("Pattern: cascade / domino")
+    offset_deg   = 180 // NUM_SERVOS          # 22.5° stagger per channel
+    total_steps  = 360
+
+    for _ in range(reps):
+        for t in range(total_steps):
+            angles = [
+                abs(((t + ch * offset_deg) % 360) - 180)
+                for ch in CHANNELS
+            ]
+            servos_move(angles)
+            time.sleep_ms(step)
+
+
+def pattern_split_centre(reps=2, step=2, delay_ms=12):
+    """
+    Servo 0 and 7 are mirrors (open/close from the edges inward),
+    1 & 6, 2 & 5, 3 & 4 follow the same mirror logic — like a butterfly.
+    """
+    print("Pattern: butterfly / mirror pairs")
+    pairs = [(0, 7), (1, 6), (2, 5), (3, 4)]
+
+    for _ in range(reps):
+        for a in range(0, 181, step):
+            angles = [0] * NUM_SERVOS
+            for lo, hi in pairs:
+                angles[lo] = a
+                angles[hi] = 180 - a
+            servos_move(angles)
+            time.sleep_ms(delay_ms)
+        for a in range(180, -1, -step):
+            angles = [0] * NUM_SERVOS
+            for lo, hi in pairs:
+                angles[lo] = a
+                angles[hi] = 180 - a
+            servos_move(angles)
+            time.sleep_ms(delay_ms)
+
+
+def pattern_random_targets(iterations=40, delay_ms=400):
+    """
+    Each servo jumps to a random independent target angle and holds briefly.
+    Uses a simple LCG pseudo-random generator (no urandom needed).
+    """
+    print("Pattern: random independent targets")
+    seed = 12345
+    def lcg():
+        nonlocal seed
+        seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+        return seed
+
+    for _ in range(iterations):
+        angles = [(lcg() % 181) for _ in CHANNELS]
+        servos_move(angles)
+        time.sleep_ms(delay_ms)
+
+
+def pattern_stagger_sweep(reps=2, delay_ms=60):
+    """
+    Servos sweep one at a time in sequence (0→7) while others hold position,
+    then sweep back in reverse order (7→0).
+    """
+    print("Pattern: stagger one-by-one sweep")
+    current = [90] * NUM_SERVOS
+
+    for _ in range(reps):
+        # Forward pass: each servo sweeps 0→180 while others hold
+        for ch in CHANNELS:
+            for a in range(0, 181, 5):
+                current[ch] = a
+                servos_move(current)
+                time.sleep_ms(delay_ms)
+
+        # Backward pass: each servo sweeps 180→0 in reverse channel order
+        for ch in reversed(CHANNELS):
+            for a in range(180, -1, -5):
+                current[ch] = a
+                servos_move(current)
+                time.sleep_ms(delay_ms)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+pca9685_init()
+print("PCA9685 initialised — 8 servos on channels 0-7 at 50 Hz")
+
+centre_all()
+time.sleep_ms(800)
+
+PATTERNS = [
+    pattern_sweep_together,
+    pattern_sweep_opposite,
+    pattern_wave,
+    pattern_cascade,
+    pattern_split_centre,
+    pattern_random_targets,
+    pattern_stagger_sweep,
+]
+
+while True:
+    for pattern in PATTERNS:
+        pattern()
+        centre_all()
+        time.sleep_ms(600)   # brief pause between patterns
